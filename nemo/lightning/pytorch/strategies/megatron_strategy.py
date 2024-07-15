@@ -201,15 +201,6 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             assert self.model is not None
             self.model = self._layer_sync.apply(self.model)
 
-        datamodule = getattr(trainer, "datamodule", None)
-        if not self.data_sampler and hasattr(datamodule, "data_sampler"):
-            self.data_sampler = datamodule.data_sampler
-            self.data_sampler.setup(self.cluster_environment.global_rank())
-
-        if self.data_sampler:
-            self.data_sampler.connect(trainer)
-
-        self._fix_progress_bar(trainer)
         self.setup_megatron_parallel(trainer)
         self.setup_precision_plugin()
 
@@ -249,26 +240,6 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             # we need to manually synchronize the module's states since we aren't using the DDP wrapper
             assert self.model is not None
             _sync_module_states(self.model)
-
-    @override
-    def setup_distributed(self) -> None:
-        self._setup_parallel_ranks()
-        super().setup_distributed()
-
-        from megatron.core import parallel_state
-
-        from nemo.utils import AppState
-
-        # init model parallel if needed
-        if not parallel_state.model_parallel_is_initialized():
-            app_state = AppState()
-
-            if app_state.model_parallel_size is not None:
-                _strategy_lib.init_model_parallel(self.model)
-
-        if self.data_sampler:
-            assert isinstance(self.cluster_environment, ClusterEnvironment), "Cluster environment not initialized"
-            self.data_sampler.setup(self.cluster_environment.global_rank())
 
     @override
     def process_dataloader(self, dataloader: DataLoader) -> DataLoader:
@@ -362,12 +333,6 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             self.optimizers = _optimizers
 
         _optimizers_to_device(self.optimizers, self.root_device)
-
-    def _setup_parallel_ranks(self) -> None:
-        self.set_world_ranks()
-        env = cast(ClusterEnvironment, self.cluster_environment)
-
-        _strategy_lib.init_parallel_ranks(env.world_size(), env.global_rank(), env.local_rank(), self.parallelism)
 
     @override
     def training_step(self, dataloader_iter, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
@@ -482,20 +447,6 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         kwargs.update(self._data_config_kwargs(dataloader_iter))
 
         return kwargs
-
-    def _fix_progress_bar(self, trainer: pl.Trainer) -> None:
-        callbacks: List[pl.Callback] = cast(List[pl.Callback], getattr(trainer, "callbacks"))
-        contains_megatron_progress, contains_progress = False, False
-        for callback in callbacks:
-            if isinstance(callback, MegatronProgressBar):
-                contains_megatron_progress = True
-            if callback.__class__ == TQDMProgressBar:
-                contains_progress = True
-        if not contains_megatron_progress and contains_progress:
-            for callback in callbacks:
-                if isinstance(callback, TQDMProgressBar):
-                    callback.__class__ = MegatronProgressBar
-                    break
 
     def optimizer_sharded_state_dict(self, is_loading=False):
         """
