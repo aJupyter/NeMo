@@ -78,6 +78,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         ddp (Union[DDPLiteral, DistributedDataParallelConfig]): DDP configuration. Defaults to "megatron".
         lazy_init (bool): Use lazy initialization for model parallel parameters. Defaults to False.
         pipeline_dtype (Optional[torch.dtype]): Data type for pipeline parallelism. Defaults to None.
+        ddp_weight_parity_check_interval (int): How frequently to check DDP weights for errors. Default to -1 (off).
         **kwargs: Additional keyword arguments.
 
     Note:
