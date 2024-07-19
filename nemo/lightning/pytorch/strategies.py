@@ -15,6 +15,7 @@ from lightning_fabric.plugins import CheckpointIO, ClusterEnvironment
 from lightning_fabric.utilities.optimizer import _optimizer_to_device, _optimizers_to_device
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.utils import check_param_hashes_across_dp_replicas
 from pytorch_lightning.accelerators import CPUAccelerator
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
 from pytorch_lightning.loops import _AutomaticOptimization, evaluation_loop, fit_loop, prediction_loop
@@ -114,6 +115,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         ckpt_load_directly_on_device=True,
         setup_optimizers: bool = True,
         init_model_parallel: bool = True,
+        ddp_weight_parity_check_interval: int = -1,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -160,6 +162,9 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             self.no_ddp_communication_hook = False
         else:
             raise ValueError(f"Invalid DDP type: {ddp}")
+
+        self.ddp_weight_parity_check_interval = ddp_weight_parity_check_interval
+        self.ddp_weight_parity_check_count = 0
 
         # used in NVIDIA NGC PyTorch containers
         _strategy_lib.enable_nvidia_optimizations()
@@ -371,6 +376,20 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
 
         _strategy_lib.init_parallel_ranks(env.world_size(), env.global_rank(), env.local_rank(), self.parallelism)
 
+    def _check_weight_parity(self):
+        has_dist_opt_with_ovelap = self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
+        if has_dist_opt_with_ovelap:
+            for opt in self.optimizers:
+                opt.disable_pre_hook()
+        # @akoumparouli: do we need both barriers?
+        torch.distributed.barrier()
+        assert check_param_hashes_across_dp_replicas(self.model), \
+            "Parameter hashes not matching across DP replicas"
+        torch.distributed.barrier()
+        if has_dist_opt_with_ovelap:
+            for opt in self.optimizers:
+                opt.enable_pre_hook()
+
     @override
     def training_step(self, dataloader_iter, *args: Any, **kwargs: Any) -> STEP_OUTPUT:
         assert self.lightning_module is not None
@@ -385,6 +404,11 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
                 opt.zero_grad()
 
             out = self.model(dataloader_iter, forward_only=False, *args, **kwargs)
+
+            self.ddp_weight_parity_check_count += 1
+            if self.ddp_weight_parity_check_count == self.ddp_weight_parity_check_interval:
+                self.ddp_weight_parity_check_count = 0
+                self._check_weight_parity()
 
             self.lightning_module.log(
                 'global_step',
